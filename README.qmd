@@ -12,3 +12,348 @@ bibliography: "inst/REFERENCES.bib"
 
 FLTM-JM is a joint modeling framework for multivariate longitudinal ordinal variables and time-to-event data with right censoring. A Bayesian framework is utilized for parameter estimation and dynamic prediction. The posterior sampling is done by *Stan* in *R*, utilizing the package *rstan*. This vignette illustrates implementation of FLTM-JM on a simulated data.
 
+-   Call necessary R packages
+
+```{r}
+#| message: false
+#| warning: false
+library(splines)
+library(rstan)
+library(parallel)
+library(foreach)
+library(tdROC)
+library(survival)
+```
+
+-   Settings for parallel execution of all Monte Carlo chains
+
+```{r}
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+-   We first generate survival data with right censoring. The process start with defining the true parameters
+
+```{r}
+# Bspline on finite grid
+time_grid<-seq(0,1,by=0.01)
+bnd_knts<-c(0,1)
+BS<-bs(time_grid, df = 10, intercept=TRUE, degree=3,Boundary.knots = bnd_knts)
+knts<-attr(BS,"knots")
+```
+
+-   A constant baseline hazard function over the functional domain
+
+```{r}
+# constant baseline hazard
+bh_coef<-0.5
+bh_t<-rep(exp(bh_coef),length(time_grid))
+```
+
+-   We consider a single covariate for Cox Proportion Hazard (CoxPH) model, which is genearted from *U(0,1)*.
+
+```{r}
+N<-100 # sample size
+Xpred<-cbind(runif(N,0,1)) # covariate for CoxPH model
+```
+
+-   For subject-specific random deviation, $U_i(t), in the latent trait $\theta_i(t)$ is defined by two orthogonal eigenfunctions, which we define by Fourier basis as follows. 
+
+```{r}
+# Eigenfunction
+M<-2
+psiFUN<-function(time){
+  rbind(sqrt(2)*cos(2*pi*time),
+        sqrt(2)*sin(2*time*pi))
+}
+plot(time_grid,psiFUN(time_grid)[1,],type="l",xlab=expression(t),ylab=expression(phi[m](t)))
+lines(time_grid,psiFUN(time_grid)[2,],lty=2)
+```
+
+-   We generate scores corresponding to the two eigenfunctions from $N(0,\sigma_1^2)$ and $N(0,\sigma_2^2)$ by setting $\sigma_1=0.2$ and $\sigma_2=0.1$
+
+```{r}
+true_lmda<-c(0.2,0.1)
+set.seed(125)
+Zscr<-sapply(1:M,function(m){
+  rnorm(N,0,sqrt(true_lmda[m]))
+})
+```
+
+-   We consider that the latent trait $\theta_i(t)$ depends on a baseline treatment information. The associated coeffcients are functions defined as follows. 
+
+```{r}
+treat_pts = rbinom(N,1,prob = 0.5)
+Xdesign<-cbind(1,treat_pts)
+betaFUN<-function(time){
+  rbind(2.5+1.25*sin(2.75*time*pi) ,(12*time * sin(0.2*pi*time))+(0.25*cos(0.5*pi*time)))
+}
+plot(time_grid,betaFUN(time_grid)[1,],type="l",xlab=expression(t),ylab=expression(beta[l](t)),ylim=c(0,8))
+lines(time_grid,betaFUN(time_grid)[2,],lty=2)
+legend(x=0.4,y=8,legend = c(expression(beta[0](t)),expression(beta[1](t))),lty = c(1,2),bty="n",horiz=TRUE)
+```
+
+-   Latent traits for all subjects
+
+```{r}
+theta<-(Xdesign%*%betaFUN(time_grid))+(Zscr%*%psiFUN(time_grid))
+matplot(time_grid,t(theta),type="l",lty=1,col=treat_pts+1,ylab=expression(theta[i](t)),xlab=expression(t))
+```
+
+-   Function for survival data generation
+
+```{r}
+event_time_coxPH<-function(bh_t,t_arg,int_wt,designM,beta_coef,theta,rho_par,delta=0.1,unif_par=c(0,1)){
+  n<-nrow(designM)
+  hFUN<-t(sapply(1:n, function(i){
+    a<-sum(designM[i,]*beta_coef)+ (rho_par*theta[i,])
+    Hz<-(bh_t*int_wt)*exp(a)
+    exp(-cumsum(Hz))
+  }))
+  usam<-runif(n,unif_par[1],unif_par[2])
+  ev_time<-t_arg[sapply(1:n, function(i){which(hFUN[i,]<usam[i])[1]})]
+  ev_time[which(is.na(ev_time))]<-max(t_arg)+delta
+  ev_time
+}
+```
+
+```{r}
+gam_par<--1.10 # coefficient associated with survival covariate
+rho_par<-0.20 # parameter associated with severity profiel theta_i(t) in the CoxPH model
+qwt<-rep(time_grid[2]-time_grid[1],length(time_grid)) # weights for Reimann integral
+sv_time<-event_time_coxPH(bh_t=bh_t,
+                          t_arg = time_grid,
+                          designM = Xpred,
+                          beta_coef = gam_par,
+                          theta = theta,
+                          rho_par =  rho_par,
+                          int_wt = qwt,
+                          unif_par=c(0,0.9))
+
+summary(sv_time) # summary of the event time
+```
+
+- Generation of censored time for all N subjects
+
+```{r}
+cenT<-runif(N,0.1,10)
+cen_status<-apply(cbind(sv_time,cenT),1,which.min)-1
+mean(cen_status)
+cen_sub<-which(cen_status==1)
+
+fsv_time<-apply(cbind(sv_time,cenT),1,min)
+
+cen_indx<-which(fsv_time>1)
+
+fsv_time[cen_indx]<-1
+cen_status[cen_indx]<-1
+mean(cen_status) # percentage of censoring
+summary(fsv_time) # summary of the observed time-to-event data
+```
+
+-   Longitudinal data generation, considering 2 ordinal variables with 5 five categories in each
+
+```{r}
+ti_pos<-lapply(1:N, function(i){
+  sort(sample(1:length(time_grid[time_grid<fsv_time[i]]),min(length(time_grid[time_grid<fsv_time[i]]),sample(3:8,1)),replace=FALSE))
+})
+
+m_i<-sapply(ti_pos, length)
+
+subID<-rep(1:N,m_i)
+
+theta_ij<-lapply(1:N,function(i){
+  as.numeric(Xdesign[i,]%*%betaFUN(time_grid[ti_pos[[i]]]))+as.numeric(Zscr[i,]%*%psiFUN(time_grid[ti_pos[[i]]]))})
+
+expit <- function(x) exp(x)/(1+exp(x))
+
+K_ordi<-2
+n_ordi<-rep(5,K_ordi)
+a_ordi<-matrix(c(0,3.2,4.8,6.5,4.5,6.2,8.8,9.5),nrow=K_ordi,byrow = TRUE)
+b_ordi<-c(1,2.25)
+
+n_ordi<-rep(5,K_ordi)
+
+y_val<-do.call(rbind,lapply(1:N,function(i){
+  do.call(rbind,lapply(1:m_i[i], function(j){
+    t(sapply(1:K_ordi,function(k){
+      cm_prb<-c(expit(sapply(a_ordi[k,], function(u){u-b_ordi[k]*theta_ij[[i]][j]})),1)
+      sample(1:n_ordi[k],1,prob = c(cm_prb[1],cm_prb[2:n_ordi[k]]-cm_prb[1:(n_ordi[k]-1)]))
+    }))
+  }))
+}))
+table(y_val[,1]) # summary of the fist ordinal variable
+table(y_val[,2]) # summary of the second ordinal variable
+```
+
+- Neceassary quantities for posterior sampling using Stan.
+
+```{r}
+# Basis for baseline hazard function at the observed survival time
+#sur_basis=bs(fsv_time, knots = knts, intercept = TRUE, degree=3)
+gridPOS<-sapply(fsv_time, function(x){
+  which.min(sqrt((x-time_grid)^2))
+})
+
+# construction of peanlty matrix
+D<-length(time_grid)
+nu = .1
+diff0 = diag(1, D, D)
+diff2 = matrix(rep(c(1,-2,1, rep(0, D-2)), D-2)[1:((D-2)*D)], D-2, D, byrow = TRUE)
+P0 = t(BS) %*% t(diff0) %*% diff0 %*% BS
+P2 = t(BS) %*% t(diff2) %*% diff2 %*% BS
+P.mat = nu * P0 + (1-nu) * P2
+P.mat1 = solve(P.mat)
+```
+
+-   Stan data object preparation
+
+```{r}
+stan_dat<-list(N=N,
+               P_surv = ncol(Xpred),
+               W=Xpred,
+               surv_time=fsv_time,
+               status=1-cen_status,
+               n_basis=ncol(BS),
+               Tgrid=length(time_grid),
+               BasisM=BS,
+               TGpos=gridPOS,
+               cHW=qwt,
+               PenMat=P.mat1,
+               obs=sum(m_i),
+               subID=subID,
+               longPOS=do.call(c,ti_pos),
+               K_ordi=K_ordi,
+               n_ordi=n_ordi,
+               total_cat=sum(n_ordi),
+               y_val=y_val,
+               lt_cov=ncol(Xdesign),
+               Xdesign=Xdesign,
+               M=2)
+```
+
+-   Initial value for the chains
+
+```{r}
+# Initial values
+
+inits01 <- list(gam_par=as.array(rep(0,ncol(Xpred))),
+                bh_coef = rep(0.2,ncol(BS)),
+                bh_sig=0.5,
+                coef_par=matrix(0.5,nrow=M,ncol=ncol(BS)),
+                coef_sig=array(rep(1,M)),
+                rho_par=0.1,
+                a_ordi_temp = as.array(rep(1,K_ordi-1)), 
+                b_ordi_temp = as.array(rep(0.1,K_ordi-1)), 
+                delta = rep(0.5,sum(n_ordi-1)-K_ordi),
+                beta_par=matrix(rep(0.1,ncol(BS)*ncol(Xdesign)),ncol = ncol(BS)))
+
+inits02 <- list(bh_coef = rep(-0.2,ncol(BS)),
+                gam_par=as.array(rep(0.5,ncol(Xpred))),
+                bh_sig=0.25,
+                coef_par=matrix(1.5,nrow=M,ncol=ncol(BS)),
+                coef_sig=array(rep(0.3,M)),
+                rho_par=0.3,
+                a_ordi_temp = as.array(rep(2,K_ordi-1)), 
+                b_ordi_temp = as.array(rep(0.5,K_ordi-1)),
+                delta = rep(0.15,sum(n_ordi-1)-K_ordi),
+                beta_par=matrix(rep(1.1,ncol(BS)*ncol(Xdesign)),ncol = ncol(BS)))
+
+# Specification of parameters
+
+inits = list(c1 = inits01,c2=inits02)
+```
+
+-   Specification of parameters
+
+```{r}
+pars = c("bh_coef",
+         "gam_par",
+         "bh_sig",
+         "coef_par",
+         "coef_sig",
+         "rho_par",
+         "a_ordi",
+         "b_ordi",
+         "beta_par",
+         "beta_sig",
+         "lmd")
+```
+
+-   Loading the stan model
+
+```{r}
+stan_md<-stan_model("Stan_Models/model_fltjm.stan")
+```
+
+-   Sampling from the posterior distribution
+
+```{r}
+#| eval: false
+#| results: hide
+#| message: false
+post_ss<-500
+warm_ss<-300
+compT<-NULL
+pt1<-as.numeric(proc.time())[3]
+stan_obj=sampling(object = stan_md,
+                  data = stan_dat, 
+                  iter = post_ss, 
+                  warmup = warm_ss, 
+                  chains = 2, 
+                  thin=1, 
+                  init = inits, 
+                  pars = pars, 
+                  control = list(adapt_delta = 0.8, max_treedepth=10),verbose=TRUE)
+pt2<-as.numeric(proc.time())[3]
+compT<-c(compT,pt2-pt1)
+save(stan_obj,file="Results/stan_obj.RData")
+```
+
+```{r}
+load(file="Results/stan_obj.RData")
+res_sum<-summary(stan_obj)$summary
+```
+
+```{r}
+res_sum
+```
+
+- Estimated eigenfunctions, $\widehat{\phi}_m(\cdot)$
+
+```{r}
+cfP<-rstan::extract(stan_obj,pars=c("coef_par"))$coef_par
+cfM<-t(sapply(1:dim(cfP)[2], function(k){colMeans(cfP[,k,])}))
+egF<-svd(t(BS%*%t(cfM)))$v
+par(mfrow=c(1,2))
+plot(time_grid,egF[,1]*sqrt(length(time_grid)),type="l",ylim=c(-2,2),ylab=expression(hat(phi)[1](t)),xlab=expression(t))
+lines(time_grid,psiFUN(time_grid)[1,],col="red")
+plot(time_grid,egF[,2]*sqrt(length(time_grid)),type="l",ylim=c(-2,2),ylab=expression(hat(phi)[2](t)),xlab=expression(t))
+lines(time_grid,-psiFUN(time_grid)[2,],col="red") # unique upto a sign change
+```
+
+```{r}
+est_rho<-mean(rstan::extract(stan_obj,pars=c('rho_par'))$rho_par)
+est_rho # estimated rho parameters
+```
+
+```{r}
+est_gam<-mean(rstan::extract(stan_obj,pars=c('gam_par'))$gam_par)
+est_gam # estimated gamma parameters
+```
+
+```{r}
+est_bh<-as.numeric(exp(BS%*%matrix(res_sum[1:10,1])))
+plot(time_grid,est_bh,type="l",ylab=expression(hat(h)[0](t)),xlab=expression(t)) # estimated baseline 
+```
+
+```{r}
+est_beta<-colMeans(rstan::extract(stan_obj,pars=c('beta_par'))$beta_par)
+par(mfrow=c(1,2))
+plot(time_grid,(BS%*%t(est_beta))[,1],type="l",ylim=c(0,5),ylab=expression(beta[0](t)),xlab=expression(t))
+lines(time_grid,betaFUN(time=time_grid)[1,],col="red")
+legend(x=-0.05,y=5.25,legend = c("Estimated","True"),lty=c(1,1),col=c("black","red"),bty="n",horiz=TRUE)
+plot(time_grid,(BS%*%t(est_beta))[,2],type="l",ylim=c(0,8),ylab=expression(beta[1](t)),xlab=expression(t))
+lines(time_grid,betaFUN(time=time_grid)[2,],col="red")
+legend(x=-0.01,y=8.5,legend = c("Estimated","True"),lty=c(1,1),col=c("black","red"),bty="n",horiz=TRUE)
+```
